@@ -1,0 +1,25 @@
+## GreenhubToClash
+
+**将 Greenhub 转换成 Clash 可以导入的节点**
+
+**在线订阅网址(节点显示数量因作者家里网络而异): [clash.theconsole.top/greenhub/v2ray.yaml](https://clash.theconsole.top/greenhub/v2ray.yaml)**
+
+
+
+## 安装方法
+
+你需要一个 python 环境 ( 比如 Python 3.10.19 ) <br/>
+
+然后执行代码安装依赖:
+
+``````
+pip install requirements.txt
+``````
+
+之后直接启动:
+
+``````
+python FastAPI.py
+``````
+
+如果不出意外的话那么你也许可以通过 http://127.0.0.1:8833/greenhub/v2ray.yaml 来访问到配置(需等待所有节点测试完毕)
