@@ -23,3 +23,7 @@ python FastAPI.py
 ``````
 
 如果不出意外的话那么你也许可以通过 http://127.0.0.1:8833/greenhub/v2ray.yaml 来访问到配置(需等待所有节点测试完毕)
+
+## 屏幕截图
+
+![PixPin_2026-04-14_21-45-38](https://raw.githubusercontent.com/daijunhaoMinecraft/Image/main/PixPin_2026-04-14_21-45-38.png)
