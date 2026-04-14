@@ -1,0 +1,6 @@
+curl_cffi
+requests
+fastapi
+hashlib
+hmac
+yaml
