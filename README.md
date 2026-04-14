@@ -27,3 +27,6 @@ python FastAPI.py
 ## 屏幕截图
 
 ![PixPin_2026-04-14_21-45-38](https://raw.githubusercontent.com/daijunhaoMinecraft/Image/main/PixPin_2026-04-14_21-45-38.png)
+
+## 感谢
+感谢 [linux.do](https://linux.do) 社区的宣传
