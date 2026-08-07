@@ -1,245 +1,281 @@
 import base64
-import sys
-import time
-import subprocess
-
-import curl_cffi.requests.exceptions
-from curl_cffi import requests
-#import requests
 import json
-from fastapi import FastAPI
+import time
 import threading
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from urllib.parse import urlencode
 import hashlib
 import hmac
 import yaml
-from fastapi.responses import Response
+from fastapi import FastAPI, Response
+from curl_cffi import requests
+import curl_cffi.requests.exceptions
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-serverListJson = {}
-yamlConfig = {
-    "port": 7890,
-    "socks-port": 1456,
-    "allow-lan": False,
-    "mode": "rule",
-    "log-level": "info",
-    "external-controller": "127.0.0.1:9090",
-    "proxies": [],
-    "proxy-groups": [
-
-    ],
-    "rules": []
-}
-uid = "f33e3c8d-6d03-40f4-963c-6cfd753e15d6"
-
-# Init
-#requests.packages.urllib3.disable_warnings()
-session = requests.Session()
-session.verify = False
-app = FastAPI()
-logging.basicConfig(level=logging.INFO)
+# ============ 日志与基础配置 ============
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def getNodeConfig(HOST: str):
-    HMAC_KEY = b'5f5749e77a9b'
-    VERSION = '2.3.0'
-    PLATFORM = 'win'
+UID = "f33e3c8d-6d03-40f4-963c-6cfd753e15d6"
+HMAC_KEY = b'5f5749e77a9b'
+VERSION = '2.3.0'
+PLATFORM = 'win'
+MAX_WORKERS = 20  # 线程池大小
 
-    timestamp_ms = int(time.time() * 1000)
-    body_data_dict = {}
-    body_data_dict['timestamp'] = timestamp_ms
-    body_data_dict['uid'] = uid
-    body_data_dict['version'] = VERSION
-    string_to_sign = urlencode(body_data_dict)
+app = FastAPI(title="Proxy Subscription Server")
 
-    hmac_obj = hmac.new(HMAC_KEY, string_to_sign.encode('utf-8'), hashlib.sha256)
-    signature_bytes = hmac_obj.digest()
-    sign = base64.b64encode(signature_bytes).decode('utf-8')
-
-    query_params = {
-        'uid': uid,
-        'version': VERSION,
-        'platform': PLATFORM,
-        'sign': sign
-    }
-    headers = {
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) GreenHub/2.3.0 Chrome/91.0.4472.164 Electron/13.6.9 Safari/537.36",
-        "content-type": "application/json",
-        "accept-encoding": "gzip, deflate, br",
-        "accept-language": "zh-CN",
-        "accept": "application/json, text/plain, */*",
-        "Connection": "keep-alive"
-    }
-    final_url = f"https://{HOST}/d/v1/account?{urlencode(query_params)}"
-    response = requests.post(final_url, json=body_data_dict,headers=headers , verify=False)
-    return response.json()
-
-
-def getServerList():
-    global serverListJson
-    try:
-        serverListJson = session.get("https://d1fumiloozdotj.cloudfront.net/v1/server_list_v7.json").json()
-    except Exception as e:
-        logger.fatal(f"获取节点出现错误: {e}")
-        if serverListJson == {}:
-            sys.exit()
-
-def threadGetServerList():
-    while True:
-        getServerList()
-        getServerConfig()
-        time.sleep(300)
-
-def ping_host(host: str) -> bool:
-    """
-    Ping主机以检查是否可达
-    """
-    try:
-        # Windows系统使用-n参数，其他系统使用-c参数
-        param = "-n" if sys.platform.lower() == "win32" else "-c"
-        result = subprocess.run(
-            ["ping", param, "1", host],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5
-        )
-        return result.returncode == 0
-    except:
-        return False
-
-def process_node(server_label_zh: str, node: Dict[str, Any], proxy_groups: Dict[str, Any], 
-                 proxies_list: List[Dict[str, Any]], rules_list: List[str]):
-    """
-    处理单个节点
-    """
-    nodeDomain = node["domain"]
-    nodeName = "[" + server_label_zh + "]" + node["label_zh"]
-    nodePath = server_label_zh + " -> " + nodeName
-    
-    # 先ping检测节点是否可达
-    # if not ping_host(nodeDomain):
-    #     logger.fatal(f"节点无法Ping通，已跳过: {nodeDomain}")
-    #     return
-    
-    # check status
-    try:
-        nodeStatusResult = session.get(
-            f"https://{nodeDomain}/d/v1/status?uid=f33e3c8d-6d03-40f4-963c-6cfd753e15d6&version=2.3.0&platform=win", 
-            timeout=3
-        ).json()
+# ============ 核心数据管理器 ============
+class SubscriptionManager:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.verify = False
         
-        # Get Session config
-        sessionResult = getNodeConfig(nodeDomain)
-        proxy_groups["proxies"].append(nodeName)
-        proxy = {
-            "name": nodeName,
-            "type": "vmess",
-            "server": nodeDomain,
-            "port": sessionResult["data"]["port"],
-            "uuid": sessionResult["data"]["id"],
-            "alterId": 0,
-            "cipher": "auto",
-            "udp": True,
-            "tls": True,
-            "network": "ws",
-            "ws-opts": {"path": sessionResult["data"]["path"]}
+        # 缓存各种格式的配置
+        self.raw_nodes = []       # 原始统一节点数据
+        self.clash_yaml = ""      # Clash 配置文件
+        self.singbox_json = ""    # Sing-box 配置文件
+        self.v2ray_base64 = ""    # V2ray/v2rayN 订阅链接
+        
+        self.is_ready = False     # 是否初始化完成
+
+    def get_node_config(self, host: str) -> Dict:
+        """调用 API 获取单个节点具体配置 (不进行Ping测试)"""
+        timestamp_ms = int(time.time() * 1000)
+        body_data_dict = {'timestamp': timestamp_ms, 'uid': UID, 'version': VERSION}
+        string_to_sign = urlencode(body_data_dict)
+        
+        signature = base64.b64encode(
+            hmac.new(HMAC_KEY, string_to_sign.encode('utf-8'), hashlib.sha256).digest()
+        ).decode('utf-8')
+
+        headers = {
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 GreenHub/2.3.0",
+            "content-type": "application/json",
+            "accept": "application/json"
         }
-        proxies_list.append(proxy)
-        rules_list.append(f"DOMAIN,tiktok.com,{nodeName}")
-        rules_list.append(f"DOMAIN,tiktokcdn.com,{nodeName}")
-        rules_list.append(f"MATCH,{nodeName}")
-    except curl_cffi.requests.exceptions.Timeout:
-        logger.fatal(f"获取节点状态超时: {nodeDomain}")
-    except Exception as e:
-        logger.fatal(f"获取节点状态失败: {e}")
-
-def process_server(server: Dict[str, Any], proxy_groups_list: List[Dict[str, Any]], 
-                   proxies_list: List[Dict[str, Any]], rules_list: List[str]):
-    """
-    处理单个服务器及其所有节点
-    """
-    if server["id"] == "QQJD":
-        return
         
-    proxyGroups = {
-        "name": server["label_zh"],
-        "type": "select",
-        "proxies": []
-    }
-    
-    # 使用多线程处理该服务器下的所有节点
-    node_threads = []
-    for node in server["servers"]:
-        node_thread = threading.Thread(
-            target=process_node, 
-            args=(server["label_zh"], node, proxyGroups, proxies_list, rules_list)
-        )
-        node_threads.append(node_thread)
-        node_thread.start()
-    
-    # 等待所有节点处理完成
-    for node_thread in node_threads:
-        node_thread.join()
-    
-    # 只有当代理组中有代理时才添加到列表中
-    if proxyGroups["proxies"]:
-        proxy_groups_list.append(proxyGroups)
+        query_params = {'uid': UID, 'version': VERSION, 'platform': PLATFORM, 'sign': signature}
+        final_url = f"https://{host}/d/v1/account?{urlencode(query_params)}"
+        
+        response = self.session.post(final_url, json=body_data_dict, headers=headers, timeout=10)
+        return response.json()
 
-def getServerConfig():
-    global yamlConfig
-    yamlConfigPrivate = {
-        "port": 7890,
-        "socks-port": 1456,
-        "allow-lan": False,
-        "mode": "rule",
-        "log-level": "info",
-        "external-controller": "127.0.0.1:9090",
-        "proxies": [],
-        "proxy-groups": [
+    def _process_single_node(self, global_index: int, server_label_zh: str, node: Dict[str, Any]) -> Tuple[int, Dict]:
+        """处理单节点信息提取"""
+        node_name = f"[{server_label_zh}]{node['label_zh']}"
+        node_domain = node["domain"]
+        
+        try:
+            session_result = self.get_node_config(node_domain)
+            data = session_result.get("data", {})
+            
+            if not data.get("port") or not data.get("id"):
+                return None
+                
+            raw_node = {
+                "name": node_name,
+                "server": node_domain,
+                "port": int(data.get("port")),
+                "uuid": data.get("id"),
+                "path": data.get("path", "/")
+            }
+            return global_index, raw_node
+            
+        except Exception as e:
+            logger.debug(f"节点获取失败 {node_domain}: {e}")
+        return None
 
-        ],
-        "rules": []
-    }
-    if serverListJson == {}:
-        logger.fatal(f"未获取到节点列表")
-        return
-    
-    # 用于存储结果的线程安全列表
-    proxy_groups_list = []
-    proxies_list = []
-    rules_list = []
-    
-    # 使用多线程处理每个服务器
-    server_threads = []
-    for server in serverListJson["data"]:
-        server_thread = threading.Thread(
-            target=process_server,
-            args=(server, proxy_groups_list, proxies_list, rules_list)
-        )
-        server_threads.append(server_thread)
-        server_thread.start()
-    
-    # 等待所有服务器处理完成
-    for server_thread in server_threads:
-        server_thread.join()
-    
-    # 将结果赋值给yamlConfig
-    yamlConfig["proxies"] = proxies_list
-    yamlConfig["proxy-groups"] = proxy_groups_list
-    yamlConfig["rules"] = rules_list
-    print("get ok!")
+    def refresh_nodes(self):
+        """主刷新流程：获取节点列表 -> 并发获取详情 -> 构建多版本配置"""
+        logger.info("开始刷新节点数据...")
+        try:
+            # 1. 获取服务器列表
+            res = self.session.get("https://d1fumiloozdotj.cloudfront.net/v1/server_list_v7.json", timeout=10)
+            server_list = res.json()
+            
+            if "data" not in server_list:
+                logger.error("未获取到节点列表数据")
+                return
 
+            tasks = []
+            global_index = 0
+            for server in server_list["data"]:
+                if server["id"] == "QQJD":
+                    continue
+                for node in server.get("servers", []):
+                    tasks.append((global_index, server["label_zh"], node))
+                    global_index += 1
 
-@app.get("/greenhub/v2ray.yaml")
-def get_v2ray_yaml():
-    return Response(yaml.dump(yamlConfig), media_type="text/plain")
+            # 2. 并发获取节点详情
+            results = []
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                future_to_index = {
+                    executor.submit(self._process_single_node, idx, srv_label, node): idx 
+                    for idx, srv_label, node in tasks
+                }
+                for future in as_completed(future_to_index):
+                    result = future.result()
+                    if result:
+                        results.append(result)
 
+            # 3. 按原始顺序排序并提取
+            results.sort(key=lambda x: x[0])
+            self.raw_nodes = [res[1] for res in results]
+            logger.info(f"成功获取 {len(self.raw_nodes)} 个节点信息。开始生成配置...")
+
+            # 4. 构建配置
+            if self.raw_nodes:
+                self.build_clash_config()
+                self.build_singbox_config()
+                self.build_v2ray_sub()
+                self.is_ready = True
+                logger.info("所有配置生成完毕。")
+            else:
+                logger.warning("获取到的有效节点数为 0。")
+
+        except Exception as e:
+            logger.error(f"刷新节点数据时发生异常: {e}")
+
+    # ============ 配置生成器 (Builders) ============
+
+    def build_clash_config(self):
+        """构建 Clash YAML 格式"""
+        proxies = []
+        node_names = []
+        
+        for node in self.raw_nodes:
+            proxy = {
+                "name": node["name"], "type": "vmess", "server": node["server"],
+                "port": node["port"], "uuid": node["uuid"], "alterId": 0,
+                "cipher": "auto", "udp": True, "tls": True, "network": "ws",
+                "ws-opts": {"path": node["path"]}
+            }
+            proxies.append(proxy)
+            node_names.append(node["name"])
+
+        groups = [
+            {"name": "代理模式", "type": "select", "proxies": ["自动选择", "手动选择", "DIRECT"]},
+            {"name": "手动选择", "type": "select", "proxies": node_names},
+            {"name": "自动选择", "type": "url-test", "url": "http://www.gstatic.com/generate_204", "interval": 300, "proxies": node_names}
+        ]
+
+        # 增加中国大陆直连规则
+        rules = [
+            "GEOSITE,cn,DIRECT",
+            "GEOIP,LAN,DIRECT",
+            "GEOIP,CN,DIRECT",
+            "MATCH,代理模式"
+        ]
+
+        clash_dict = {
+            "port": 7890, "socks-port": 7891, "allow-lan": True, "mode": "rule",
+            "log-level": "info", "proxies": proxies, "proxy-groups": groups, "rules": rules
+        }
+        
+        self.clash_yaml = yaml.dump(clash_dict, allow_unicode=True, sort_keys=False)
+
+    def build_singbox_config(self):
+        """构建 Sing-box JSON 格式"""
+        outbounds = [
+            {"type": "selector", "tag": "PROXY", "outbounds": ["AUTO", "MANUAL"]},
+            {"type": "urltest", "tag": "AUTO", "outbounds": []},
+            {"type": "selector", "tag": "MANUAL", "outbounds": []},
+            {"type": "direct", "tag": "DIRECT"},
+            {"type": "block", "tag": "BLOCK"}
+        ]
+        
+        node_tags = []
+        for node in self.raw_nodes:
+            tag = node["name"]
+            node_tags.append(tag)
+            outbounds.append({
+                "type": "vmess", "tag": tag, "server": node["server"], "server_port": node["port"],
+                "uuid": node["uuid"], "security": "auto",
+                "tls": {"enabled": True, "server_name": node["server"], "insecure": True},
+                "transport": {"type": "ws", "path": node["path"]}
+            })
+            
+        outbounds[1]["outbounds"] = node_tags  # 放入 AUTO
+        outbounds[2]["outbounds"] = node_tags  # 放入 MANUAL
+
+        singbox_dict = {
+            "log": {"level": "info"},
+            "outbounds": outbounds,
+            "route": {
+                "rules": [
+                    {"geosite": ["cn"], "outbound": "DIRECT"},
+                    {"geoip": ["cn", "private"], "outbound": "DIRECT"}
+                ],
+                "auto_detect_interface": True
+            }
+        }
+        self.singbox_json = json.dumps(singbox_dict, ensure_ascii=False, indent=2)
+
+    def build_v2ray_sub(self):
+        """构建标准 V2Ray/v2rayN Base64 订阅"""
+        links = []
+        for node in self.raw_nodes:
+            v_dict = {
+                "v": "2", "ps": node["name"], "add": node["server"], "port": str(node["port"]),
+                "id": node["uuid"], "aid": "0", "scy": "auto", "net": "ws", "type": "none",
+                "host": node["server"], "path": node["path"], "tls": "tls", "sni": node["server"]
+            }
+            # vmess 协议标准：vmess:// + base64(json)
+            json_str = json.dumps(v_dict, separators=(',', ':')).encode('utf-8')
+            vmess_link = "vmess://" + base64.b64encode(json_str).decode('utf-8')
+            links.append(vmess_link)
+            
+        raw_sub = "\n".join(links)
+        self.v2ray_base64 = base64.b64encode(raw_sub.encode('utf-8')).decode('utf-8')
+
+# 实例化全局管理器
+sub_manager = SubscriptionManager()
+
+def background_task():
+    """后台定时刷新任务"""
+    while True:
+        sub_manager.refresh_nodes()
+        time.sleep(300)  # 5分钟刷新一次
+
+# ============ FastAPI 路由 (拆分且语义化) ============
+
+@app.get("/")
+def index():
+    return {"status": "running", "ready": sub_manager.is_ready, "nodes_count": len(sub_manager.raw_nodes)}
+
+@app.get("/sub/clash")
+def get_clash_yaml():
+    """提供给 Clash / Clash Meta (Mihomo) 的订阅"""
+    if not sub_manager.is_ready:
+        return Response("Configuration is updating, please try again in a few seconds.", status_code=503)
+    return Response(sub_manager.clash_yaml, media_type="text/plain; charset=utf-8")
+
+@app.get("/sub/singbox")
+def get_singbox_json():
+    """提供给 Sing-box 的订阅"""
+    if not sub_manager.is_ready:
+        return Response("Configuration is updating...", status_code=503)
+    return Response(sub_manager.singbox_json, media_type="application/json; charset=utf-8")
+
+@app.get("/sub/v2ray")
+def get_v2ray_base64():
+    """提供给 V2Ray / v2rayN / Nekoray / Shadowrocket 等通用客户端的订阅"""
+    if not sub_manager.is_ready:
+        return Response("Configuration is updating...", status_code=503)
+    return Response(sub_manager.v2ray_base64, media_type="text/plain; charset=utf-8")
+
+# ============ 启动入口 ============
 if __name__ == "__main__":
-    # First Get ServerList
-    #print(getNodeConfig("gdus009.westmgreen.com"))
-    threading.Thread(target=threadGetServerList, daemon=True).start()
-    logger.info("初始化节点列表成功!")
+    logger.info("服务正在初始化...")
+    
+    # 首次启动时同步拉取一次数据
+    sub_manager.refresh_nodes()
+    
+    # 启动后台刷新线程
+    threading.Thread(target=background_task, daemon=True).start()
+    logger.info("后台刷新线程已启动。")
+    
+    # 启动 FastAPI 服务
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8833)
-    # #print(serverListJson)
