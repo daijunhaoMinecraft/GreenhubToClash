@@ -2,7 +2,7 @@
 
 **将 Greenhub 转换成 Clash 可以导入的节点**
 
-**在线订阅网址(节点显示数量因作者家里网络而异): **<br/>
+**在线订阅网址(节点显示数量因作者家里网络而异):**<br/>
 clash: https://clash.theconsole.top/sub/clash<br/>
 v2rayN: https://clash.theconsole.top/sub/v2ray<br/>
 singBox: https://clash.theconsole.top/sub/singbox<br/>
